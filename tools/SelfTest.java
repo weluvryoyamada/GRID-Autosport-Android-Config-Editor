@@ -73,6 +73,36 @@ public class SelfTest {
         for (String k : new String[]{"FeralFPSCap", "FeralNightFPSCap"}) check(fresh.getDouble(PrefFile.SETUP, k, 99) != 99, "fps cap double exists " + k);
         for (String k : new String[]{"Enable", "FPSTarget", "MinScaling"}) check(fresh.has(PrefFile.DRS, k), "DRS key exists " + k);
 
+        // ---- GameFiles: fake game dir with the real file + decoys
+        java.nio.file.Path tmp = Files.createTempDirectory("gamefiles");
+        java.nio.file.Path files = Files.createDirectories(tmp.resolve("Android/data/x/files/sub"));
+        Files.write(files.resolve("preferences"), orig.getBytes("UTF-8"));
+        Files.write(files.resolve("notes"), "hello".getBytes());
+        Files.write(files.resolve("data.bin"), new byte[100]);
+        Files.write(tmp.resolve("Android/data/x/other"), "<registry><key name=\"a\">".getBytes());
+        java.util.List<String> hits = GameFiles.findDirect(java.util.Arrays.asList(tmp.toString()), 6);
+        check(hits.size() == 2, "finder returns valid pref-like files only (" + hits.size() + ")");
+        String real = files.resolve("preferences").toRealPath().toString();
+        check(hits.contains(real), "finder located the real preferences file");
+        check(GameFiles.findDirect(java.util.Arrays.asList("/nonexistent/dir"), 5).isEmpty(), "missing dir -> no results, no crash");
+        byte[] got = GameFiles.readDirect(real);
+        check(new String(got, "UTF-8").equals(orig), "readDirect returns identical bytes");
+        PrefFile h = new PrefFile(new String(got, "UTF-8"));
+        h.setString(PrefFile.SETUP, "gfxconfig_water", "low");
+        GameFiles.writeDirect(real, h.toString().getBytes("UTF-8"));
+        check(new PrefFile(new String(GameFiles.readDirect(real), "UTF-8")).getString(PrefFile.SETUP, "gfxconfig_water", "").equals("low"), "writeDirect persists edit");
+        check(GameFiles.su("true", null, 3000) == null || true, "su probe does not throw");
+
+        // ---- Advisor
+        check(Advisor.recommend(11500, 120f).level.equals("ultrahigh") && Advisor.recommend(11500, 120f).fps == 120, "12GB/120Hz -> ultrahigh @120");
+        check(Advisor.recommend(7600, 60f).level.equals("high") && Advisor.recommend(7600, 60f).fps == 60, "8GB/60Hz -> high @60 (capped by display)");
+        check(Advisor.recommend(2800, 60f).level.equals("ultralow") && Advisor.recommend(2800, 60f).fps == 30, "3GB -> ultralow @30");
+        PrefFile ap = new PrefFile(orig);
+        Advisor.apply(ap, GfxSpec.Profile.MAIN, Advisor.recommend(5600, 60f), true);
+        check(ap.getString(PrefFile.SETUP, "gfxconfig_textures", "").equals("medium") && ap.getString(PrefFile.SETUP, "gfxconfig_high_textures", "").equals("medium"), "advisor applies preset to Main and High");
+        check(ap.getInt(PrefFile.SETUP, "gfxconfig_max_fps", 0) == 60 && GfxSpec.readScale(ap, GfxSpec.Profile.MAIN) == 80 && ap.getDouble(PrefFile.DRS, "FPSTarget", 0) == 60.0, "advisor sets fps, scale, DRS target");
+        check(new PrefFile(ap.toString()).entries().size() == ap.entries().size(), "advised file re-parses");
+
         System.out.println(fails == 0 ? "\nALL PASSED" : "\n" + fails + " FAILED");
         System.exit(fails == 0 ? 0 : 1);
     }

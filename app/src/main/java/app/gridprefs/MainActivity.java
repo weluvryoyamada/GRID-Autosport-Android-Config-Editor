@@ -7,7 +7,19 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.app.ActivityManager;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.DisplayMetrics;
+import android.view.Display;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -41,6 +53,8 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
+import app.gridprefs.core.Advisor;
+import app.gridprefs.core.GameFiles;
 import app.gridprefs.core.GfxSpec;
 import app.gridprefs.core.GfxSpec.Profile;
 import app.gridprefs.core.GfxSpec.Setting;
@@ -50,6 +64,7 @@ public class MainActivity extends Activity {
 
     private static final int REQ_OPEN = 1;
     private static final int REQ_SAVE_AS = 2;
+    private static final int REQ_PERM = 3;
 
     private static final int BG = Color.rgb(18, 20, 24);
     private static final int CARD = Color.rgb(30, 34, 41);
@@ -59,11 +74,14 @@ public class MainActivity extends Activity {
 
     private PrefFile pref;
     private Uri currentUri;
+    private String currentPath;   // set when the file was found/opened by path (direct or root)
+    private boolean currentRoot;  // true when reads/writes must go through su
+    private String gpuName;
     private boolean dirty;
 
     private Profile profile = Profile.MAIN;
     private boolean mirrorToHigh = true;
-    private int tab = 0;
+    private int tab = 1;
 
     private TextView status;
     private FrameLayout content;
@@ -113,6 +131,9 @@ public class MainActivity extends Activity {
         bar.addView(button("Open", new View.OnClickListener() {
             public void onClick(View v) { openFile(); }
         }), weight());
+        bar.addView(button("Find game file", new View.OnClickListener() {
+            public void onClick(View v) { findGameFile(); }
+        }), weight());
         bar.addView(button("Save", new View.OnClickListener() {
             public void onClick(View v) { save(); }
         }), weight());
@@ -124,14 +145,15 @@ public class MainActivity extends Activity {
         LinearLayout tabs = new LinearLayout(this);
         tabs.setOrientation(LinearLayout.HORIZONTAL);
         tabs.setPadding(dp(8), dp(4), dp(8), dp(4));
-        String[] names = {"Graphics", "Resolution", "Extras", "All values"};
+        String[] names = {"Device", "Graphics", "Resolution", "Extras", "All values"};
         tabButtons = new Button[names.length];
         for (int i = 0; i < names.length; i++) {
             final int idx = i;
             Button t = button(names[i], new View.OnClickListener() {
                 public void onClick(View v) { tab = idx; render(); }
             });
-            t.setTextSize(12);
+            t.setTextSize(11);
+            t.setPadding(0, 0, 0, 0);
             tabButtons[i] = t;
             tabs.addView(t, weight());
         }
@@ -172,7 +194,9 @@ public class MainActivity extends Activity {
         if (pref == null) {
             status.setText("No file open — tap Open and pick your 'preferences' file");
         } else {
-            String n = currentUri == null ? "file" : lastSegment(currentUri);
+            String n = currentPath != null
+                    ? new File(currentPath).getName() + (currentRoot ? " (via root)" : " (direct)")
+                    : (currentUri == null ? "file" : lastSegment(currentUri));
             status.setText(n + (dirty ? "  • unsaved changes" : "  • saved"));
         }
     }
@@ -226,6 +250,8 @@ public class MainActivity extends Activity {
         } else if (req == REQ_SAVE_AS) {
             if (writeTo(uri)) {
                 currentUri = uri;
+                currentPath = null;
+                currentRoot = false;
                 getSharedPreferences("app", MODE_PRIVATE).edit().putString("lastUri", uri.toString()).apply();
                 dirty = false;
                 setStatus();
@@ -244,7 +270,17 @@ public class MainActivity extends Activity {
         } finally {
             in.close();
         }
-        byte[] bytes = bos.toByteArray();
+        adopt(bos.toByteArray());
+        currentUri = uri;
+        currentPath = null;
+        currentRoot = false;
+        getSharedPreferences("app", MODE_PRIVATE).edit().putString("lastUri", uri.toString()).apply();
+        setStatus();
+        if (announce) toast("Opened. A backup copy was saved inside the app.");
+    }
+
+    /** Parses and validates bytes as a preferences file, keeps a backup, and makes it the open file. */
+    private void adopt(byte[] bytes) throws Exception {
         String text = new String(bytes, "UTF-8");
         PrefFile p = new PrefFile(text);
         if (!p.has(PrefFile.SETUP, "ScreenW") && p.getString(PrefFile.SETUP, "gfxconfig_textures", null) == null) {
@@ -252,11 +288,102 @@ public class MainActivity extends Activity {
         }
         backup(bytes);
         pref = p;
-        currentUri = uri;
         dirty = false;
-        getSharedPreferences("app", MODE_PRIVATE).edit().putString("lastUri", uri.toString()).apply();
-        setStatus();
-        if (announce) toast("Opened. A backup copy was saved inside the app.");
+    }
+
+    // ------------------------------------------------------------------ find game file
+
+    private void findGameFile() {
+        if (Build.VERSION.SDK_INT <= 29
+                && checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                    android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_PERM);
+            return;
+        }
+        toast("Searching... if you have root, approve the prompt");
+        new Thread(new Runnable() {
+            public void run() {
+                final List<String> direct = GameFiles.findDirect(GameFiles.candidateDirs(), 5);
+                final List<String> rooted = new ArrayList<>();
+                if (direct.isEmpty()) rooted.addAll(GameFiles.findViaRoot());
+                runOnUiThread(new Runnable() {
+                    public void run() { showFound(direct, rooted); }
+                });
+            }
+        }).start();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(req, perms, results);
+        if (req == REQ_PERM) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) findGameFile();
+            else toast("Storage permission denied");
+        }
+    }
+
+    private void showFound(List<String> direct, List<String> rooted) {
+        final List<String> paths = new ArrayList<>(direct);
+        paths.addAll(rooted);
+        final boolean viaRoot = direct.isEmpty();
+        if (paths.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Game file not reachable")
+                    .setMessage("Android does not let one app read another app's private folder ("
+                            + GameFiles.PACKAGE + ") unless the device is rooted, or on Android 10 "
+                            + "and older.\n\nWhat works instead:\n"
+                            + "1. In a file manager that can browse Android/data (for example one with "
+                            + "Shizuku support), copy the 'preferences' file to Downloads.\n"
+                            + "2. Tap Open here and pick that copy.\n"
+                            + "3. After saving, copy it back over the game's file with the game closed.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+        if (paths.size() == 1) {
+            openPath(paths.get(0), viaRoot);
+            return;
+        }
+        final String[] items = paths.toArray(new String[0]);
+        new AlertDialog.Builder(this)
+                .setTitle("Pick the file to edit")
+                .setItems(items, new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        openPath(items[which], viaRoot);
+                    }
+                })
+                .show();
+    }
+
+    private void openPath(final String path, final boolean viaRoot) {
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    final byte[] bytes = viaRoot ? GameFiles.readViaRoot(path) : GameFiles.readDirect(path);
+                    runOnUiThread(new Runnable() {
+                        public void run() {
+                            try {
+                                adopt(bytes);
+                                currentPath = path;
+                                currentRoot = viaRoot;
+                                currentUri = null;
+                                getSharedPreferences("app", MODE_PRIVATE).edit().remove("lastUri").apply();
+                                toast("Opened game file. Close the game before saving.");
+                                render();
+                            } catch (Exception e) {
+                                toast("Not usable: " + e.getMessage());
+                            }
+                        }
+                    });
+                } catch (final Exception e) {
+                    runOnUiThread(new Runnable() {
+                        public void run() { toast("Could not read: " + e.getMessage()); }
+                    });
+                }
+            }
+        }).start();
     }
 
     /** Keeps an untouched copy of every file we open, in the app's private storage. */
@@ -283,11 +410,47 @@ public class MainActivity extends Activity {
 
     private void save() {
         if (pref == null) { toast("Open a file first"); return; }
+        if (currentPath != null) { savePath(); return; }
         if (currentUri == null) { saveAs(); return; }
         if (writeTo(currentUri)) {
             dirty = false;
             setStatus();
         }
+    }
+
+    private void savePath() {
+        final byte[] data;
+        try {
+            data = pref.toString().getBytes("UTF-8");
+        } catch (Exception e) {
+            toast("Save failed");
+            return;
+        }
+        final String path = currentPath;
+        final boolean root = currentRoot;
+        new Thread(new Runnable() {
+            public void run() {
+                String err = null;
+                try {
+                    if (root) GameFiles.writeViaRoot(path, data);
+                    else GameFiles.writeDirect(path, data);
+                } catch (Exception e) {
+                    err = e.getMessage();
+                }
+                final String fe = err;
+                runOnUiThread(new Runnable() {
+                    public void run() {
+                        if (fe == null) {
+                            dirty = false;
+                            setStatus();
+                            toast("Saved to game file");
+                        } else {
+                            toast("Save failed: " + fe + " - try 'Save as...'");
+                        }
+                    }
+                });
+            }
+        }).start();
     }
 
     private boolean writeTo(Uri uri) {
@@ -326,7 +489,7 @@ public class MainActivity extends Activity {
         setStatus();
         content.removeAllViews();
         if (pref == null) {
-            TextView t = text("Open your GRID Autosport 'preferences' file to start editing.\n\n"
+            TextView t = text("Tap 'Find game file' to look for the game's preferences automatically, or 'Open' to pick a copy.\n\n"
                     + "An untouched backup is kept inside this app every time you open a file.", 14, MUTED, false);
             t.setGravity(Gravity.CENTER);
             t.setPadding(dp(24), dp(24), dp(24), dp(24));
@@ -334,9 +497,10 @@ public class MainActivity extends Activity {
             return;
         }
         switch (tab) {
-            case 0: content.addView(scroll(graphicsView())); break;
-            case 1: content.addView(scroll(resolutionView())); break;
-            case 2: content.addView(scroll(extrasView())); break;
+            case 0: content.addView(scroll(deviceView())); break;
+            case 1: content.addView(scroll(graphicsView())); break;
+            case 2: content.addView(scroll(resolutionView())); break;
+            case 3: content.addView(scroll(extrasView())); break;
             default: content.addView(rawView()); break;
         }
     }
@@ -378,6 +542,113 @@ public class MainActivity extends Activity {
         TextView t = text(s, 12, ACCENT, true);
         t.setPadding(dp(4), dp(14), 0, dp(4));
         return t;
+    }
+
+    // ------------------------------------------------------------------ Device tab
+
+    private View deviceView() {
+        LinearLayout c = column();
+        c.addView(header("THIS DEVICE"));
+
+        ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+        am.getMemoryInfo(mi);
+        long ramMb = mi.totalMem / (1024 * 1024);
+
+        Display d = getWindowManager().getDefaultDisplay();
+        DisplayMetrics dm = new DisplayMetrics();
+        d.getRealMetrics(dm);
+        float maxHz = d.getRefreshRate();
+        for (Display.Mode m : d.getSupportedModes()) maxHz = Math.max(maxHz, m.getRefreshRate());
+        final int w = Math.max(dm.widthPixels, dm.heightPixels);
+        final int h = Math.min(dm.widthPixels, dm.heightPixels);
+
+        if (gpuName == null) gpuName = detectGpu();
+        String soc = Build.VERSION.SDK_INT >= 31
+                ? Build.SOC_MANUFACTURER + " " + Build.SOC_MODEL : Build.HARDWARE;
+
+        c.addView(infoRow("Device", Build.MANUFACTURER + " " + Build.MODEL));
+        c.addView(infoRow("Chipset", soc));
+        c.addView(infoRow("GPU", gpuName == null ? "unknown" : gpuName));
+        c.addView(infoRow("RAM", String.format(Locale.US, "%.1f GB (as reported by Android)", ramMb / 1024.0)));
+        c.addView(infoRow("Screen", w + " x " + h + " px, " + dm.densityDpi + " dpi"));
+        c.addView(infoRow("Refresh rate", Math.round(maxHz) + " Hz (highest supported)"));
+
+        final Advisor.Plan plan = Advisor.recommend(ramMb, maxHz);
+        c.addView(header("SUGGESTED SETUP"));
+        TextView why = text(plan.reason + "\nResolution slider: " + plan.scalePercent + "%.\n"
+                + "Rule of thumb from RAM and refresh rate only, so treat it as a starting point.", 13, TEXT, false);
+        why.setPadding(dp(4), dp(2), dp(4), dp(8));
+        c.addView(why);
+
+        if (pref == null) {
+            c.addView(text("Open or find the preferences file first to apply this.", 12, MUTED, false));
+        } else {
+            Button apply = button("Apply to " + profile.label + " profile", new View.OnClickListener() {
+                public void onClick(View v) {
+                    Advisor.apply(pref, profile, plan, mirrorToHigh);
+                    changed();
+                    toast("Applied. Review on the other tabs, then Save.");
+                }
+            });
+            c.addView(apply);
+
+            Button res = button("Write this screen's size into the file (" + w + " x " + h + ")",
+                    new View.OnClickListener() {
+                public void onClick(View v) {
+                    pref.setInt(PrefFile.SETUP, "ScreenW", w);
+                    pref.setInt(PrefFile.SETUP, "ScreenH", h);
+                    changed();
+                    toast("ScreenW / ScreenH updated");
+                }
+            });
+            c.addView(res);
+            c.addView(text("The game rewrites ScreenW/ScreenH itself on launch, so this mainly keeps the "
+                    + "resolution readout on the Resolution tab accurate.", 10, MUTED, false));
+
+            String cr = pref.getString(PrefFile.SETUP, "CardRenderer", null);
+            if (cr != null) {
+                c.addView(header("FILE SAYS"));
+                c.addView(infoRow("CardRenderer", cr));
+                c.addView(infoRow("ScreenW x ScreenH", pref.getInt(PrefFile.SETUP, "ScreenW", 0)
+                        + " x " + pref.getInt(PrefFile.SETUP, "ScreenH", 0)));
+            }
+        }
+        return c;
+    }
+
+    private View infoRow(String k, String v) {
+        TextView val = text(v, 13, TEXT, false);
+        val.setGravity(Gravity.END);
+        return row(k, null, val);
+    }
+
+    /** Reads GL_RENDERER from a throw-away off-screen GLES2 context. Null if anything fails. */
+    private String detectGpu() {
+        try {
+            EGLDisplay disp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+            int[] ver = new int[2];
+            if (!EGL14.eglInitialize(disp, ver, 0, ver, 1)) return null;
+            int[] cfgAttr = {EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                    EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE};
+            EGLConfig[] cfgs = new EGLConfig[1];
+            int[] num = new int[1];
+            EGL14.eglChooseConfig(disp, cfgAttr, 0, cfgs, 0, 1, num, 0);
+            if (num[0] == 0) return null;
+            int[] ctxAttr = {EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE};
+            EGLContext ctx = EGL14.eglCreateContext(disp, cfgs[0], EGL14.EGL_NO_CONTEXT, ctxAttr, 0);
+            int[] sAttr = {EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE};
+            EGLSurface surf = EGL14.eglCreatePbufferSurface(disp, cfgs[0], sAttr, 0);
+            EGL14.eglMakeCurrent(disp, surf, surf, ctx);
+            String r = GLES20.glGetString(GLES20.GL_RENDERER);
+            EGL14.eglMakeCurrent(disp, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+            EGL14.eglDestroySurface(disp, surf);
+            EGL14.eglDestroyContext(disp, ctx);
+            EGL14.eglTerminate(disp);
+            return r;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ------------------------------------------------------------------ Graphics tab
